@@ -192,32 +192,26 @@ class CameraController:
 			centertemp = (rawtemp / 64) - 273.15
 			centertemp = round(centertemp, 2)
 
+			# Calculate temperature for all pixels
+			# Combine hi and lo bytes for raw temperature values
+			raw_temp_array = (thdata[..., 0].astype(float) + (thdata[..., 1].astype(float) * 256))
+			# Convert to Celsius
+			temp_array = (raw_temp_array / 64) - 273.15
+
 			# Find max temperature
-			lomax = thdata[..., 1].max()
-			posmax = thdata[..., 1].argmax()
+			maxtemp = float(temp_array.max())
+			posmax = temp_array.argmax()
 			mcol, mrow = divmod(posmax, self.width)
-			himax = thdata[mcol][mrow][0]
-			lomax = float(lomax) * 256
-			maxtemp = float(himax) + lomax
-			maxtemp = (maxtemp / 64) - 273.15
 			maxtemp = round(maxtemp, 2)
 
 			# Find min temperature
-			lomin = thdata[..., 1].min()
-			posmin = thdata[..., 1].argmin()
+			mintemp = float(temp_array.min())
+			posmin = temp_array.argmin()
 			lcol, lrow = divmod(posmin, self.width)
-			himin = thdata[lcol][lrow][0]
-			lomin = float(lomin) * 256
-			mintemp = float(himin) + lomin
-			mintemp = (mintemp / 64) - 273.15
 			mintemp = round(mintemp, 2)
 
-			# Find average temperature
-			loavg = thdata[..., 1].mean()
-			hiavg = thdata[..., 0].mean()
-			loavg = float(loavg) * 256
-			avgtemp = float(loavg) + hiavg
-			avgtemp = (avgtemp / 64) - 273.15
+			# Find average temperature (use the already calculated temp_array)
+			avgtemp = float(temp_array.mean())
 			avgtemp = round(avgtemp, 2)
 
 			# Store temperatures
