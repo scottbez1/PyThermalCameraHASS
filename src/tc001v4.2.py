@@ -29,6 +29,9 @@ import numpy as np
 import argparse
 import time
 import io
+import threading
+import socketserver
+from http.server import BaseHTTPRequestHandler
 
 #We need to know if we are running on the Pi, because openCV behaves a little oddly on all the builds!
 #https://raspberrypi.stackexchange.com/questions/5100/detect-that-a-python-program-is-running-on-the-pi
@@ -43,6 +46,9 @@ isPi = is_raspberrypi()
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--device", type=int, default=0, help="Video Device number e.g. 0, use v4l2-ctl --list-devices")
+parser.add_argument("--stream", action="store_true", help="Enable MJPEG streaming server")
+parser.add_argument("--port", type=int, default=8080, help="Port for MJPEG streaming server (default: 8080)")
+parser.add_argument("--headless", action="store_true", help="Run without OpenCV window (headless mode)")
 args = parser.parse_args()
 	
 if args.device:
@@ -58,7 +64,7 @@ cap = cv2.VideoCapture('/dev/video'+str(dev), cv2.CAP_V4L)
 if isPi == True:
 	cap.set(cv2.CAP_PROP_CONVERT_RGB, 0.0)
 else:
-	cap.set(cv2.CAP_PROP_CONVERT_RGB, False)
+	cap.set(cv2.CAP_PROP_CONVERT_RGB, 0.0)
 
 #256x192 General settings
 width = 256 #Sensor width
@@ -70,8 +76,9 @@ alpha = 1.0 # Contrast control (1.0-3.0)
 colormap = 0
 font=cv2.FONT_HERSHEY_SIMPLEX
 dispFullscreen = False
-cv2.namedWindow('Thermal',cv2.WINDOW_GUI_NORMAL)
-cv2.resizeWindow('Thermal', newWidth,newHeight)
+if not args.headless:
+	cv2.namedWindow('Thermal',cv2.WINDOW_GUI_NORMAL)
+	cv2.resizeWindow('Thermal', newWidth,newHeight)
 rad = 0 #blur radius
 threshold = 2
 hud = True
@@ -87,11 +94,88 @@ def rec():
 
 def snapshot(heatmap):
 	#I would put colons in here, but it Win throws a fit if you try and open them!
-	now = time.strftime("%Y%m%d-%H%M%S") 
+	now = time.strftime("%Y%m%d-%H%M%S")
 	snaptime = time.strftime("%H:%M:%S")
 	cv2.imwrite("TC001"+now+".png", heatmap)
 	return snaptime
- 
+
+# MJPEG Streaming Infrastructure
+class StreamingOutput:
+	def __init__(self):
+		self.frame = None
+		self.lock = threading.Lock()
+
+	def update_frame(self, frame):
+		with self.lock:
+			self.frame = frame.copy()
+
+	def get_frame(self):
+		with self.lock:
+			if self.frame is None:
+				return None
+			return self.frame.copy()
+
+class StreamingHandler(BaseHTTPRequestHandler):
+	def do_GET(self):
+		if self.path == '/stream.mjpg':
+			self.send_response(200)
+			self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=--jpgboundary')
+			self.send_header('Cache-Control', 'no-cache')
+			self.send_header('Pragma', 'no-cache')
+			self.end_headers()
+			try:
+				while True:
+					frame = streaming_output.get_frame()
+					if frame is not None:
+						# Encode frame as JPEG
+						ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+						if ret:
+							self.wfile.write(b'--jpgboundary\r\n')
+							self.send_header('Content-Type', 'image/jpeg')
+							self.send_header('Content-Length', str(len(jpeg)))
+							self.end_headers()
+							self.wfile.write(jpeg.tobytes())
+							self.wfile.write(b'\r\n')
+					time.sleep(0.033)  # ~30 fps
+			except Exception:
+				pass
+		elif self.path == '/':
+			self.send_response(200)
+			self.send_header('Content-Type', 'text/html')
+			self.end_headers()
+			html = b'''
+			<html>
+			<head><title>Thermal Camera Stream</title></head>
+			<body>
+			<h1>TC001 Thermal Camera Stream</h1>
+			<img src="/stream.mjpg" />
+			</body>
+			</html>
+			'''
+			self.wfile.write(html)
+		else:
+			self.send_response(404)
+			self.end_headers()
+
+	def log_message(self, format, *args):
+		# Suppress HTTP server logs
+		pass
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+	allow_reuse_address = True
+	daemon_threads = True
+
+# Initialize streaming output if streaming is enabled
+streaming_output = None
+if args.stream:
+	streaming_output = StreamingOutput()
+	server = ThreadedHTTPServer(('0.0.0.0', args.port), StreamingHandler)
+	server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+	server_thread.start()
+	print(f'MJPEG streaming server started on port {args.port}')
+	print(f'Access stream at: http://localhost:{args.port}/stream.mjpg')
+	print(f'Or view in browser at: http://localhost:{args.port}/')
+
 
 while(cap.isOpened()):
 	# Capture frame-by-frame
@@ -262,15 +346,26 @@ while(cap.isOpened()):
 			cv2.FONT_HERSHEY_SIMPLEX, 0.45,(0, 255, 255), 1, cv2.LINE_AA)
 
 		#display image
-		cv2.imshow('Thermal',heatmap)
+		if not args.headless:
+			cv2.imshow('Thermal',heatmap)
+
+		# Update streaming buffer if streaming is enabled
+		if args.stream and streaming_output is not None:
+			streaming_output.update_frame(heatmap)
 
 		if recording == True:
 			elapsed = (time.time() - start)
-			elapsed = time.strftime("%H:%M:%S", time.gmtime(elapsed)) 
+			elapsed = time.strftime("%H:%M:%S", time.gmtime(elapsed))
 			#print(elapsed)
 			videoOut.write(heatmap)
-		
-		keyPress = cv2.waitKey(1)
+
+		# Handle keyboard input (only works when not in headless mode)
+		if not args.headless:
+			keyPress = cv2.waitKey(1)
+		else:
+			# In headless mode, add small delay to prevent CPU spinning
+			time.sleep(0.01)
+			keyPress = -1
 		if keyPress == ord('a'): #Increase blur radius
 			rad += 1
 		if keyPress == ord('z'): #Decrease blur radius
@@ -291,7 +386,7 @@ while(cap.isOpened()):
 				scale = 5
 			newWidth = width*scale
 			newHeight = height*scale
-			if dispFullscreen == False and isPi == False:
+			if dispFullscreen == False and isPi == False and not args.headless:
 				cv2.resizeWindow('Thermal', newWidth,newHeight)
 		if keyPress == ord('c'): #Decrease scale
 			scale -= 1
@@ -299,14 +394,14 @@ while(cap.isOpened()):
 				scale = 1
 			newWidth = width*scale
 			newHeight = height*scale
-			if dispFullscreen == False and isPi == False:
+			if dispFullscreen == False and isPi == False and not args.headless:
 				cv2.resizeWindow('Thermal', newWidth,newHeight)
 
-		if keyPress == ord('q'): #enable fullscreen
+		if keyPress == ord('q') and not args.headless: #enable fullscreen
 			dispFullscreen = True
 			cv2.namedWindow('Thermal',cv2.WND_PROP_FULLSCREEN)
 			cv2.setWindowProperty('Thermal',cv2.WND_PROP_FULLSCREEN,cv2.WINDOW_FULLSCREEN)
-		if keyPress == ord('w'): #disable fullscreen
+		if keyPress == ord('w') and not args.headless: #disable fullscreen
 			dispFullscreen = False
 			cv2.namedWindow('Thermal',cv2.WINDOW_GUI_NORMAL)
 			cv2.setWindowProperty('Thermal',cv2.WND_PROP_AUTOSIZE,cv2.WINDOW_GUI_NORMAL)
