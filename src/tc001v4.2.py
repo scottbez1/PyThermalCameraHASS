@@ -96,6 +96,10 @@ def snapshot(heatmap):
 	cv2.imwrite("TC001"+now+".png", heatmap)
 	return snaptime
 
+def celsius_to_fahrenheit(celsius):
+	"""Convert Celsius to Fahrenheit"""
+	return (celsius * 9/5) + 32
+
 # Camera Controller Class
 class CameraController:
 	def __init__(self, device_num, headless=False, width=256, height=192, scale=3):
@@ -256,17 +260,22 @@ class CameraController:
 					(int(self.newWidth/2), int(self.newHeight/2)-20), (0, 0, 0), 1)
 			cv2.line(heatmap, (int(self.newWidth/2)+20, int(self.newHeight/2)),
 					(int(self.newWidth/2)-20, int(self.newHeight/2)), (0, 0, 0), 1)
-			cv2.putText(heatmap, str(centertemp)+' C', (int(self.newWidth/2)+10, int(self.newHeight/2)-10),
+			# Convert to Fahrenheit for display
+			centertemp_f = round(celsius_to_fahrenheit(centertemp), 1)
+			cv2.putText(heatmap, str(centertemp_f)+' F', (int(self.newWidth/2)+10, int(self.newHeight/2)-10),
 					cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
-			cv2.putText(heatmap, str(centertemp)+' C', (int(self.newWidth/2)+10, int(self.newHeight/2)-10),
+			cv2.putText(heatmap, str(centertemp_f)+' F', (int(self.newWidth/2)+10, int(self.newHeight/2)-10),
 					cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
 			# Draw HUD if enabled
 			if self.hud:
 				cv2.rectangle(heatmap, (0, 0), (160, 120), (0, 0, 0), -1)
-				cv2.putText(heatmap, 'Avg Temp: '+str(avgtemp)+' C', (10, 14),
+				# Convert temps to Fahrenheit for display
+				avgtemp_f = round(celsius_to_fahrenheit(avgtemp), 1)
+				threshold_f = round(celsius_to_fahrenheit(self.threshold), 1)
+				cv2.putText(heatmap, 'Avg Temp: '+str(avgtemp_f)+' F', (10, 14),
 						cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
-				cv2.putText(heatmap, 'Label Threshold: '+str(self.threshold)+' C', (10, 28),
+				cv2.putText(heatmap, 'Label Threshold: '+str(threshold_f)+' F', (10, 28),
 						cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
 				cv2.putText(heatmap, 'Colormap: '+cmapText, (10, 42),
 						cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
@@ -279,21 +288,23 @@ class CameraController:
 				cv2.putText(heatmap, 'Snapshot: '+self.snaptime+' ', (10, 98),
 						cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
 
-			# Display floating max/min temps
+			# Display floating max/min temps (convert to Fahrenheit)
 			if maxtemp > avgtemp + self.threshold:
+				maxtemp_f = round(celsius_to_fahrenheit(maxtemp), 1)
 				cv2.circle(heatmap, (mrow*self.scale, mcol*self.scale), 5, (0, 0, 0), 2)
 				cv2.circle(heatmap, (mrow*self.scale, mcol*self.scale), 5, (0, 0, 255), -1)
-				cv2.putText(heatmap, str(maxtemp)+' C', ((mrow*self.scale)+10, (mcol*self.scale)+5),
+				cv2.putText(heatmap, str(maxtemp_f)+' F', ((mrow*self.scale)+10, (mcol*self.scale)+5),
 						cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
-				cv2.putText(heatmap, str(maxtemp)+' C', ((mrow*self.scale)+10, (mcol*self.scale)+5),
+				cv2.putText(heatmap, str(maxtemp_f)+' F', ((mrow*self.scale)+10, (mcol*self.scale)+5),
 						cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
 			if mintemp < avgtemp - self.threshold:
+				mintemp_f = round(celsius_to_fahrenheit(mintemp), 1)
 				cv2.circle(heatmap, (lrow*self.scale, lcol*self.scale), 5, (0, 0, 0), 2)
 				cv2.circle(heatmap, (lrow*self.scale, lcol*self.scale), 5, (255, 0, 0), -1)
-				cv2.putText(heatmap, str(mintemp)+' C', ((lrow*self.scale)+10, (lcol*self.scale)+5),
+				cv2.putText(heatmap, str(mintemp_f)+' F', ((lrow*self.scale)+10, (lcol*self.scale)+5),
 						cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
-				cv2.putText(heatmap, str(mintemp)+' C', ((lrow*self.scale)+10, (lcol*self.scale)+5),
+				cv2.putText(heatmap, str(mintemp_f)+' F', ((lrow*self.scale)+10, (lcol*self.scale)+5),
 						cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
 			# Display image if not headless
