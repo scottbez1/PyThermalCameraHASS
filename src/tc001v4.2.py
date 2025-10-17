@@ -124,6 +124,8 @@ class CameraController:
 		self.cap = None
 		self.running = False
 		self.thread = None
+		self.mqtt_manager = None  # Will be set externally
+		self.start_time = time.time()
 
 		# Latest sensor data
 		self.maxtemp = None
@@ -151,7 +153,12 @@ class CameraController:
 		self.running = True
 		self.thread = threading.Thread(target=self._capture_loop, daemon=True)
 		self.thread.start()
+		self.start_time = time.time()
 		print("Camera started")
+
+		# Publish state change to MQTT
+		if self.mqtt_manager:
+			self.mqtt_manager._publish_camera_state()
 
 	def stop(self):
 		if not self.running:
@@ -170,13 +177,28 @@ class CameraController:
 
 		print("Camera stopped")
 
+		# Create and publish "Camera Disabled" frame
+		if args.stream and streaming_output is not None:
+			disabled_frame = np.zeros((self.newHeight, self.newWidth, 3), dtype=np.uint8)
+			cv2.putText(disabled_frame, 'CAMERA DISABLED',
+					   (int(self.newWidth/2) - 150, int(self.newHeight/2)),
+					   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+			streaming_output.update_frame(disabled_frame)
+
+		# Publish state change to MQTT
+		if self.mqtt_manager:
+			self.mqtt_manager._publish_camera_state()
+
 	def get_latest_temps(self):
+		if not self.running:
+			return None
 		with self.lock:
 			return {
 				'max': self.maxtemp,
 				'min': self.mintemp,
 				'avg': self.avgtemp,
-				'center': self.centertemp
+				'center': self.centertemp,
+				'time_since_start': time.time() - self.start_time,
 			}
 
 	def _capture_loop(self):
@@ -322,17 +344,27 @@ class CameraController:
 class StreamingOutput:
 	def __init__(self):
 		self.frame = None
+		self.frame_id = 0
 		self.lock = threading.Lock()
+		self.frame_event = threading.Event()
 
 	def update_frame(self, frame):
 		with self.lock:
 			self.frame = frame.copy()
+			self.frame_id += 1
+		self.frame_event.set()
 
-	def get_frame(self):
+	def get_frame_with_id(self):
+		"""Get current frame along with its ID"""
 		with self.lock:
 			if self.frame is None:
-				return None
-			return self.frame.copy()
+				return None, 0
+			return self.frame.copy(), self.frame_id
+
+	def wait_for_new_frame(self, timeout=1.0):
+		"""Wait for a new frame to be available"""
+		self.frame_event.clear()
+		return self.frame_event.wait(timeout)
 
 class StreamingHandler(BaseHTTPRequestHandler):
 	def do_GET(self):
@@ -343,19 +375,25 @@ class StreamingHandler(BaseHTTPRequestHandler):
 			self.send_header('Pragma', 'no-cache')
 			self.end_headers()
 			try:
+				last_frame_id = 0
 				while True:
-					frame = streaming_output.get_frame()
-					if frame is not None:
+					# Wait for a new frame to be available
+					streaming_output.wait_for_new_frame(timeout=1.0)
+
+					# Get the frame with its ID
+					frame, frame_id = streaming_output.get_frame_with_id()
+
+					# Only send if we have a new frame
+					if frame is not None and frame_id > last_frame_id:
 						# Encode frame as JPEG
 						ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
 						if ret:
-							self.wfile.write(b'--jpgboundary\r\n')
-							self.send_header('Content-Type', 'image/jpeg')
-							self.send_header('Content-Length', str(len(jpeg)))
-							self.end_headers()
+							# Write the JPEG data with proper multipart boundaries
+							self.wfile.write(b'Content-Type: image/jpeg\r\n')
+							self.wfile.write(f'Content-Length: {len(jpeg)}\r\n\r\n'.encode())
 							self.wfile.write(jpeg.tobytes())
-							self.wfile.write(b'\r\n')
-					time.sleep(0.033)  # ~30 fps
+							self.wfile.write(b'\r\n--jpgboundary\r\n')
+							last_frame_id = frame_id
 			except Exception:
 				pass
 		elif self.path == '/':
@@ -463,10 +501,10 @@ class MQTTManager:
 			if msg.topic == self.camera_command_topic:
 				if payload == "ON":
 					self.camera.start()
-					self._publish_camera_state()
+					# State will be published by camera.start()
 				elif payload == "OFF":
 					self.camera.stop()
-					self._publish_camera_state()
+					# State will be published by camera.stop()
 
 		except Exception as e:
 			print(f"MQTT: Error processing message: {e}")
@@ -524,11 +562,13 @@ class MQTTManager:
 		# Publish sensor data every 60 seconds
 		current_time = time.time()
 		if current_time - self.last_publish_time >= self.publish_interval:
-			temps = self.camera.get_latest_temps()
-			if temps['max'] is not None:
-				self.client.publish(self.max_temp_state_topic, str(temps['max']))
-				print(f"MQTT: Published max temp: {temps['max']}°C")
 			self.last_publish_time = current_time
+			temps = self.camera.get_latest_temps()
+			if temps is not None and temps['time_since_start'] > 60:
+				if temps['max'] is not None:
+					self.client.publish(self.max_temp_state_topic, str(temps['max']))
+					temp_f = round(celsius_to_fahrenheit(temps['max']), 1)
+					print(f"MQTT: Published max temp: {temps['max']}°C ({temp_f}°F)")
 
 	def disconnect(self):
 		if self.client:
@@ -554,6 +594,7 @@ camera = CameraController(dev, args.headless)
 mqtt_manager = None
 if mqtt_config:
 	mqtt_manager = MQTTManager(mqtt_config, camera)
+	camera.mqtt_manager = mqtt_manager  # Give camera reference to mqtt_manager
 	mqtt_manager.connect()
 	# Start camera automatically if MQTT is enabled
 	camera.start()
