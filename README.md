@@ -106,6 +106,60 @@ Error checking will be implemented after I refactor and optimize the code!
 
 
 
+## Home Assistant Integration (NEW!)
+
+The thermal camera now supports integration with Home Assistant via MQTT! Features include:
+
+- 🏠 **Remote camera control** - Turn camera on/off from Home Assistant
+- 🌡️ **Temperature monitoring** - Max temperature sensor updates every 60 seconds
+- 📡 **MJPEG streaming** - View live thermal feed in Home Assistant
+- 🔄 **Automatic discovery** - Entities appear automatically in Home Assistant
+
+### Quick Setup
+
+1. **Install dependencies** (using the included virtual environment):
+   ```bash
+   source venv/bin/activate
+   ```
+
+2. **Configure MQTT** - Edit `config.yaml` with your broker details
+
+3. **Run with streaming and MQTT**:
+   ```bash
+   ./run.sh --stream --headless --config config.yaml
+   ```
+
+4. **In Home Assistant**, the device will appear automatically with:
+   - Switch: Turn camera on/off
+   - Sensor: Max temperature (°C)
+
+### Run as a System Service
+
+To run automatically on boot:
+```bash
+sudo cp thermal-camera.service /etc/systemd/system/
+sudo systemctl enable thermal-camera.service
+sudo systemctl start thermal-camera.service
+```
+
+**See [HASS_INTEGRATION.md](HASS_INTEGRATION.md) for complete documentation.**
+
+### New Command Line Options
+
+- `--stream` - Enable MJPEG streaming server
+- `--port INT` - Streaming port (default: 8080)
+- `--headless` - Run without display window
+- `--config PATH` - MQTT configuration file
+
+## Files
+
+- `src/tc001v4.2.py` - Main application (now with MQTT and streaming!)
+- `config.yaml` - MQTT configuration
+- `requirements.txt` - Python dependencies
+- `run.sh` - Helper script
+- `thermal-camera.service` - Systemd service
+- `HASS_INTEGRATION.md` - Detailed integration guide
+
 ## TODO:
 
 - No Error checking is implemented!

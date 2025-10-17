@@ -32,6 +32,11 @@ import io
 import threading
 import socketserver
 from http.server import BaseHTTPRequestHandler
+import yaml
+import paho.mqtt.client as mqtt
+import json
+import signal
+import sys
 
 #We need to know if we are running on the Pi, because openCV behaves a little oddly on all the builds!
 #https://raspberrypi.stackexchange.com/questions/5100/detect-that-a-python-program-is-running-on-the-pi
@@ -49,42 +54,34 @@ parser.add_argument("--device", type=int, default=0, help="Video Device number e
 parser.add_argument("--stream", action="store_true", help="Enable MJPEG streaming server")
 parser.add_argument("--port", type=int, default=8080, help="Port for MJPEG streaming server (default: 8080)")
 parser.add_argument("--headless", action="store_true", help="Run without OpenCV window (headless mode)")
+parser.add_argument("--config", type=str, default="config.yaml", help="Path to MQTT configuration file (default: config.yaml)")
 args = parser.parse_args()
+
+# Load MQTT configuration
+mqtt_config = {}
+try:
+	with open(args.config, 'r') as f:
+		mqtt_config = yaml.safe_load(f)
+		print(f'Loaded MQTT config from {args.config}')
+except FileNotFoundError:
+	print(f'Config file {args.config} not found. MQTT features will be disabled.')
+	mqtt_config = None
+except Exception as e:
+	print(f'Error loading config file: {e}. MQTT features will be disabled.')
+	mqtt_config = None
 	
+# Get device number from args
 if args.device:
 	dev = args.device
 else:
 	dev = 0
-	
-#init video
-cap = cv2.VideoCapture('/dev/video'+str(dev), cv2.CAP_V4L)
-#cap = cv2.VideoCapture(0)
-#pull in the video but do NOT automatically convert to RGB, else it breaks the temperature data!
-#https://stackoverflow.com/questions/63108721/opencv-setting-videocap-property-to-cap-prop-convert-rgb-generates-weird-boolean
-if isPi == True:
-	cap.set(cv2.CAP_PROP_CONVERT_RGB, 0.0)
-else:
-	cap.set(cv2.CAP_PROP_CONVERT_RGB, 0.0)
 
-#256x192 General settings
-width = 256 #Sensor width
-height = 192 #sensor height
-scale = 3 #scale multiplier
-newWidth = width*scale 
+# Global settings (kept for backward compatibility with rec() and snapshot() functions)
+width = 256
+height = 192
+scale = 3
+newWidth = width*scale
 newHeight = height*scale
-alpha = 1.0 # Contrast control (1.0-3.0)
-colormap = 0
-font=cv2.FONT_HERSHEY_SIMPLEX
-dispFullscreen = False
-if not args.headless:
-	cv2.namedWindow('Thermal',cv2.WINDOW_GUI_NORMAL)
-	cv2.resizeWindow('Thermal', newWidth,newHeight)
-rad = 0 #blur radius
-threshold = 2
-hud = True
-recording = False
-elapsed = "00:00:00"
-snaptime = "None"
 
 def rec():
 	now = time.strftime("%Y%m%d--%H%M%S")
@@ -98,6 +95,223 @@ def snapshot(heatmap):
 	snaptime = time.strftime("%H:%M:%S")
 	cv2.imwrite("TC001"+now+".png", heatmap)
 	return snaptime
+
+# Camera Controller Class
+class CameraController:
+	def __init__(self, device_num, headless=False, width=256, height=192, scale=3):
+		self.device_num = device_num
+		self.headless = headless
+		self.width = width
+		self.height = height
+		self.scale = scale
+		self.newWidth = width * scale
+		self.newHeight = height * scale
+		self.alpha = 1.0
+		self.colormap = 0
+		self.rad = 0
+		self.threshold = 2
+		self.hud = True
+		self.recording = False
+		self.elapsed = "00:00:00"
+		self.snaptime = "None"
+		self.dispFullscreen = False
+
+		# Camera state
+		self.cap = None
+		self.running = False
+		self.thread = None
+
+		# Latest sensor data
+		self.maxtemp = None
+		self.mintemp = None
+		self.avgtemp = None
+		self.centertemp = None
+		self.lock = threading.Lock()
+
+	def start(self):
+		if self.running:
+			return
+
+		# Initialize video capture
+		self.cap = cv2.VideoCapture(f'/dev/video{self.device_num}', cv2.CAP_V4L)
+		if isPi:
+			self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 0.0)
+		else:
+			self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 0.0)
+
+		# Create window if not headless
+		if not self.headless and not args.headless:
+			cv2.namedWindow('Thermal', cv2.WINDOW_GUI_NORMAL)
+			cv2.resizeWindow('Thermal', self.newWidth, self.newHeight)
+
+		self.running = True
+		self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+		self.thread.start()
+		print("Camera started")
+
+	def stop(self):
+		if not self.running:
+			return
+
+		self.running = False
+		if self.thread:
+			self.thread.join(timeout=2.0)
+
+		if self.cap:
+			self.cap.release()
+			self.cap = None
+
+		if not self.headless and not args.headless:
+			cv2.destroyAllWindows()
+
+		print("Camera stopped")
+
+	def get_latest_temps(self):
+		with self.lock:
+			return {
+				'max': self.maxtemp,
+				'min': self.mintemp,
+				'avg': self.avgtemp,
+				'center': self.centertemp
+			}
+
+	def _capture_loop(self):
+		while self.running and self.cap and self.cap.isOpened():
+			ret, frame = self.cap.read()
+			if not ret:
+				time.sleep(0.01)
+				continue
+
+			imdata, thdata = np.array_split(frame, 2)
+
+			# Calculate center temperature
+			hi = thdata[96][128][0]
+			lo = thdata[96][128][1]
+			lo = float(lo) * 256
+			rawtemp = float(hi) + lo
+			centertemp = (rawtemp / 64) - 273.15
+			centertemp = round(centertemp, 2)
+
+			# Find max temperature
+			lomax = thdata[..., 1].max()
+			posmax = thdata[..., 1].argmax()
+			mcol, mrow = divmod(posmax, self.width)
+			himax = thdata[mcol][mrow][0]
+			lomax = float(lomax) * 256
+			maxtemp = float(himax) + lomax
+			maxtemp = (maxtemp / 64) - 273.15
+			maxtemp = round(maxtemp, 2)
+
+			# Find min temperature
+			lomin = thdata[..., 1].min()
+			posmin = thdata[..., 1].argmin()
+			lcol, lrow = divmod(posmin, self.width)
+			himin = thdata[lcol][lrow][0]
+			lomin = float(lomin) * 256
+			mintemp = float(himin) + lomin
+			mintemp = (mintemp / 64) - 273.15
+			mintemp = round(mintemp, 2)
+
+			# Find average temperature
+			loavg = thdata[..., 1].mean()
+			hiavg = thdata[..., 0].mean()
+			loavg = float(loavg) * 256
+			avgtemp = float(loavg) + hiavg
+			avgtemp = (avgtemp / 64) - 273.15
+			avgtemp = round(avgtemp, 2)
+
+			# Store temperatures
+			with self.lock:
+				self.maxtemp = maxtemp
+				self.mintemp = mintemp
+				self.avgtemp = avgtemp
+				self.centertemp = centertemp
+
+			# Convert image to RGB and apply processing
+			bgr = cv2.cvtColor(imdata, cv2.COLOR_YUV2BGR_YUYV)
+			bgr = cv2.convertScaleAbs(bgr, alpha=self.alpha)
+			bgr = cv2.resize(bgr, (self.newWidth, self.newHeight), interpolation=cv2.INTER_CUBIC)
+			if self.rad > 0:
+				bgr = cv2.blur(bgr, (self.rad, self.rad))
+
+			# Apply colormap
+			colormap_list = [
+				(cv2.COLORMAP_JET, 'Jet'),
+				(cv2.COLORMAP_HOT, 'Hot'),
+				(cv2.COLORMAP_MAGMA, 'Magma'),
+				(cv2.COLORMAP_INFERNO, 'Inferno'),
+				(cv2.COLORMAP_PLASMA, 'Plasma'),
+				(cv2.COLORMAP_BONE, 'Bone'),
+				(cv2.COLORMAP_SPRING, 'Spring'),
+				(cv2.COLORMAP_AUTUMN, 'Autumn'),
+				(cv2.COLORMAP_VIRIDIS, 'Viridis'),
+				(cv2.COLORMAP_PARULA, 'Parula'),
+				(cv2.COLORMAP_RAINBOW, 'Inv Rainbow')
+			]
+			cmap, cmapText = colormap_list[self.colormap % len(colormap_list)]
+			heatmap = cv2.applyColorMap(bgr, cmap)
+			if self.colormap == 10:
+				heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+
+			# Draw crosshairs and center temp
+			cv2.line(heatmap, (int(self.newWidth/2), int(self.newHeight/2)+20),
+					(int(self.newWidth/2), int(self.newHeight/2)-20), (255, 255, 255), 2)
+			cv2.line(heatmap, (int(self.newWidth/2)+20, int(self.newHeight/2)),
+					(int(self.newWidth/2)-20, int(self.newHeight/2)), (255, 255, 255), 2)
+			cv2.line(heatmap, (int(self.newWidth/2), int(self.newHeight/2)+20),
+					(int(self.newWidth/2), int(self.newHeight/2)-20), (0, 0, 0), 1)
+			cv2.line(heatmap, (int(self.newWidth/2)+20, int(self.newHeight/2)),
+					(int(self.newWidth/2)-20, int(self.newHeight/2)), (0, 0, 0), 1)
+			cv2.putText(heatmap, str(centertemp)+' C', (int(self.newWidth/2)+10, int(self.newHeight/2)-10),
+					cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
+			cv2.putText(heatmap, str(centertemp)+' C', (int(self.newWidth/2)+10, int(self.newHeight/2)-10),
+					cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+
+			# Draw HUD if enabled
+			if self.hud:
+				cv2.rectangle(heatmap, (0, 0), (160, 120), (0, 0, 0), -1)
+				cv2.putText(heatmap, 'Avg Temp: '+str(avgtemp)+' C', (10, 14),
+						cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+				cv2.putText(heatmap, 'Label Threshold: '+str(self.threshold)+' C', (10, 28),
+						cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+				cv2.putText(heatmap, 'Colormap: '+cmapText, (10, 42),
+						cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+				cv2.putText(heatmap, 'Blur: '+str(self.rad)+' ', (10, 56),
+						cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+				cv2.putText(heatmap, 'Scaling: '+str(self.scale)+' ', (10, 70),
+						cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+				cv2.putText(heatmap, 'Contrast: '+str(self.alpha)+' ', (10, 84),
+						cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+				cv2.putText(heatmap, 'Snapshot: '+self.snaptime+' ', (10, 98),
+						cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+
+			# Display floating max/min temps
+			if maxtemp > avgtemp + self.threshold:
+				cv2.circle(heatmap, (mrow*self.scale, mcol*self.scale), 5, (0, 0, 0), 2)
+				cv2.circle(heatmap, (mrow*self.scale, mcol*self.scale), 5, (0, 0, 255), -1)
+				cv2.putText(heatmap, str(maxtemp)+' C', ((mrow*self.scale)+10, (mcol*self.scale)+5),
+						cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
+				cv2.putText(heatmap, str(maxtemp)+' C', ((mrow*self.scale)+10, (mcol*self.scale)+5),
+						cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+
+			if mintemp < avgtemp - self.threshold:
+				cv2.circle(heatmap, (lrow*self.scale, lcol*self.scale), 5, (0, 0, 0), 2)
+				cv2.circle(heatmap, (lrow*self.scale, lcol*self.scale), 5, (255, 0, 0), -1)
+				cv2.putText(heatmap, str(mintemp)+' C', ((lrow*self.scale)+10, (lcol*self.scale)+5),
+						cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
+				cv2.putText(heatmap, str(mintemp)+' C', ((lrow*self.scale)+10, (lcol*self.scale)+5),
+						cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+
+			# Display image if not headless
+			if not self.headless and not args.headless:
+				cv2.imshow('Thermal', heatmap)
+				cv2.waitKey(1)
+
+			# Update streaming buffer if enabled
+			if args.stream and streaming_output is not None:
+				streaming_output.update_frame(heatmap)
+
+			time.sleep(0.01)
 
 # MJPEG Streaming Infrastructure
 class StreamingOutput:
@@ -165,6 +379,158 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 	allow_reuse_address = True
 	daemon_threads = True
 
+# MQTT Manager for Home Assistant Integration
+class MQTTManager:
+	def __init__(self, config, camera_controller):
+		self.config = config
+		self.camera = camera_controller
+		self.client = None
+		self.connected = False
+		self.last_publish_time = 0
+		self.publish_interval = 60  # Publish every 60 seconds
+
+		# MQTT topics
+		device_id = config.get('device_id', 'thermal_camera')
+		self.base_topic = f"thermal_camera"
+		self.camera_command_topic = f"{self.base_topic}/camera/set"
+		self.camera_state_topic = f"{self.base_topic}/camera/state"
+		self.max_temp_state_topic = f"{self.base_topic}/max_temp/state"
+
+		# Home Assistant discovery topics
+		self.switch_config_topic = f"homeassistant/switch/{device_id}/camera/config"
+		self.sensor_config_topic = f"homeassistant/sensor/{device_id}/max_temp/config"
+
+	def connect(self):
+		try:
+			self.client = mqtt.Client(client_id=self.config.get('mqtt_client_id', 'thermal_camera'))
+
+			# Set authentication if provided
+			username = self.config.get('mqtt_username', '')
+			password = self.config.get('mqtt_password', '')
+			if username:
+				self.client.username_pw_set(username, password)
+
+			# Set up callbacks
+			self.client.on_connect = self._on_connect
+			self.client.on_message = self._on_message
+			self.client.on_disconnect = self._on_disconnect
+
+			# Connect to broker
+			broker = self.config.get('mqtt_broker', 'localhost')
+			port = self.config.get('mqtt_port', 1883)
+			self.client.connect(broker, port, 60)
+
+			# Start network loop in background thread
+			self.client.loop_start()
+			print(f"MQTT: Connecting to {broker}:{port}")
+
+		except Exception as e:
+			print(f"MQTT: Failed to connect: {e}")
+			self.client = None
+
+	def _on_connect(self, client, userdata, flags, rc):
+		if rc == 0:
+			self.connected = True
+			print("MQTT: Connected successfully")
+
+			# Subscribe to camera command topic
+			self.client.subscribe(self.camera_command_topic)
+			print(f"MQTT: Subscribed to {self.camera_command_topic}")
+
+			# Publish Home Assistant discovery messages
+			self._publish_discovery()
+
+			# Publish initial state
+			self._publish_camera_state()
+
+		else:
+			print(f"MQTT: Connection failed with code {rc}")
+
+	def _on_disconnect(self, client, userdata, rc):
+		self.connected = False
+		print("MQTT: Disconnected")
+
+	def _on_message(self, client, userdata, msg):
+		try:
+			payload = msg.payload.decode('utf-8')
+			print(f"MQTT: Received message on {msg.topic}: {payload}")
+
+			if msg.topic == self.camera_command_topic:
+				if payload == "ON":
+					self.camera.start()
+					self._publish_camera_state()
+				elif payload == "OFF":
+					self.camera.stop()
+					self._publish_camera_state()
+
+		except Exception as e:
+			print(f"MQTT: Error processing message: {e}")
+
+	def _publish_discovery(self):
+		# Device information
+		device = {
+			"identifiers": [self.config.get('device_id', 'thermal_camera')],
+			"name": self.config.get('device_name', 'TC001 Thermal Camera'),
+			"manufacturer": self.config.get('manufacturer', 'Topdon'),
+			"model": self.config.get('model', 'TC001')
+		}
+
+		# Switch discovery config
+		switch_config = {
+			"name": "Camera",
+			"unique_id": f"{self.config.get('device_id', 'thermal_camera')}_camera",
+			"command_topic": self.camera_command_topic,
+			"state_topic": self.camera_state_topic,
+			"payload_on": "ON",
+			"payload_off": "OFF",
+			"state_on": "ON",
+			"state_off": "OFF",
+			"device": device
+		}
+
+		# Sensor discovery config
+		sensor_config = {
+			"name": "Max Temperature",
+			"unique_id": f"{self.config.get('device_id', 'thermal_camera')}_max_temp",
+			"state_topic": self.max_temp_state_topic,
+			"unit_of_measurement": "°C",
+			"device_class": "temperature",
+			"state_class": "measurement",
+			"device": device
+		}
+
+		# Publish discovery messages
+		self.client.publish(self.switch_config_topic, json.dumps(switch_config), retain=True)
+		self.client.publish(self.sensor_config_topic, json.dumps(sensor_config), retain=True)
+		print("MQTT: Published Home Assistant discovery messages")
+
+	def _publish_camera_state(self):
+		if not self.connected:
+			return
+
+		state = "ON" if self.camera.running else "OFF"
+		self.client.publish(self.camera_state_topic, state, retain=True)
+		print(f"MQTT: Published camera state: {state}")
+
+	def update(self):
+		if not self.connected or not self.camera.running:
+			return
+
+		# Publish sensor data every 60 seconds
+		current_time = time.time()
+		if current_time - self.last_publish_time >= self.publish_interval:
+			temps = self.camera.get_latest_temps()
+			if temps['max'] is not None:
+				self.client.publish(self.max_temp_state_topic, str(temps['max']))
+				print(f"MQTT: Published max temp: {temps['max']}°C")
+			self.last_publish_time = current_time
+
+	def disconnect(self):
+		if self.client:
+			self.client.loop_stop()
+			self.client.disconnect()
+			print("MQTT: Disconnected")
+
 # Initialize streaming output if streaming is enabled
 streaming_output = None
 if args.stream:
@@ -176,273 +542,44 @@ if args.stream:
 	print(f'Access stream at: http://localhost:{args.port}/stream.mjpg')
 	print(f'Or view in browser at: http://localhost:{args.port}/')
 
+# Initialize camera controller
+camera = CameraController(dev, args.headless)
 
-while(cap.isOpened()):
-	# Capture frame-by-frame
-	ret, frame = cap.read()
-	if ret == True:
-		imdata,thdata = np.array_split(frame, 2)
-		#now parse the data from the bottom frame and convert to temp!
-		#https://www.eevblog.com/forum/thermal-imaging/infiray-and-their-p2-pro-discussion/200/
-		#Huge props to LeoDJ for figuring out how the data is stored and how to compute temp from it.
-		#grab data from the center pixel...
-		hi = thdata[96][128][0]
-		lo = thdata[96][128][1]
-		#print(hi,lo)
-		lo = lo*256
-		rawtemp = hi+lo
-		#print(rawtemp)
-		temp = (rawtemp/64)-273.15
-		temp = round(temp,2)
-		#print(temp)
-		#break
+# Initialize MQTT manager if config is available
+mqtt_manager = None
+if mqtt_config:
+	mqtt_manager = MQTTManager(mqtt_config, camera)
+	mqtt_manager.connect()
+	# Start camera automatically if MQTT is enabled
+	camera.start()
+else:
+	# Start camera immediately if no MQTT
+	camera.start()
 
-		#find the max temperature in the frame
-		lomax = thdata[...,1].max()
-		posmax = thdata[...,1].argmax()
-		#since argmax returns a linear index, convert back to row and col
-		mcol,mrow = divmod(posmax,width)
-		himax = thdata[mcol][mrow][0]
-		lomax=lomax*256
-		maxtemp = himax+lomax
-		maxtemp = (maxtemp/64)-273.15
-		maxtemp = round(maxtemp,2)
+# Signal handler for graceful shutdown
+def signal_handler(sig, frame):
+	print("\nShutting down gracefully...")
+	if camera:
+		camera.stop()
+	if mqtt_manager:
+		mqtt_manager.disconnect()
+	sys.exit(0)
 
-		
-		#find the lowest temperature in the frame
-		lomin = thdata[...,1].min()
-		posmin = thdata[...,1].argmin()
-		#since argmax returns a linear index, convert back to row and col
-		lcol,lrow = divmod(posmin,width)
-		himin = thdata[lcol][lrow][0]
-		lomin=lomin*256
-		mintemp = himin+lomin
-		mintemp = (mintemp/64)-273.15
-		mintemp = round(mintemp,2)
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
-		#find the average temperature in the frame
-		loavg = thdata[...,1].mean()
-		hiavg = thdata[...,0].mean()
-		loavg=loavg*256
-		avgtemp = loavg+hiavg
-		avgtemp = (avgtemp/64)-273.15
-		avgtemp = round(avgtemp,2)
-
-		
-
-		# Convert the real image to RGB
-		bgr = cv2.cvtColor(imdata,  cv2.COLOR_YUV2BGR_YUYV)
-		#Contrast
-		bgr = cv2.convertScaleAbs(bgr, alpha=alpha)#Contrast
-		#bicubic interpolate, upscale and blur
-		bgr = cv2.resize(bgr,(newWidth,newHeight),interpolation=cv2.INTER_CUBIC)#Scale up!
-		if rad>0:
-			bgr = cv2.blur(bgr,(rad,rad))
-
-		#apply colormap
-		if colormap == 0:
-			heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_JET)
-			cmapText = 'Jet'
-		if colormap == 1:
-			heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_HOT)
-			cmapText = 'Hot'
-		if colormap == 2:
-			heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_MAGMA)
-			cmapText = 'Magma'
-		if colormap == 3:
-			heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_INFERNO)
-			cmapText = 'Inferno'
-		if colormap == 4:
-			heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_PLASMA)
-			cmapText = 'Plasma'
-		if colormap == 5:
-			heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_BONE)
-			cmapText = 'Bone'
-		if colormap == 6:
-			heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_SPRING)
-			cmapText = 'Spring'
-		if colormap == 7:
-			heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_AUTUMN)
-			cmapText = 'Autumn'
-		if colormap == 8:
-			heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_VIRIDIS)
-			cmapText = 'Viridis'
-		if colormap == 9:
-			heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_PARULA)
-			cmapText = 'Parula'
-		if colormap == 10:
-			heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_RAINBOW)
-			heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-			cmapText = 'Inv Rainbow'
-
-		#print(heatmap.shape)
-
-		# draw crosshairs
-		cv2.line(heatmap,(int(newWidth/2),int(newHeight/2)+20),\
-		(int(newWidth/2),int(newHeight/2)-20),(255,255,255),2) #vline
-		cv2.line(heatmap,(int(newWidth/2)+20,int(newHeight/2)),\
-		(int(newWidth/2)-20,int(newHeight/2)),(255,255,255),2) #hline
-
-		cv2.line(heatmap,(int(newWidth/2),int(newHeight/2)+20),\
-		(int(newWidth/2),int(newHeight/2)-20),(0,0,0),1) #vline
-		cv2.line(heatmap,(int(newWidth/2)+20,int(newHeight/2)),\
-		(int(newWidth/2)-20,int(newHeight/2)),(0,0,0),1) #hline
-		#show temp
-		cv2.putText(heatmap,str(temp)+' C', (int(newWidth/2)+10, int(newHeight/2)-10),\
-		cv2.FONT_HERSHEY_SIMPLEX, 0.45,(0, 0, 0), 2, cv2.LINE_AA)
-		cv2.putText(heatmap,str(temp)+' C', (int(newWidth/2)+10, int(newHeight/2)-10),\
-		cv2.FONT_HERSHEY_SIMPLEX, 0.45,(0, 255, 255), 1, cv2.LINE_AA)
-
-		if hud==True:
-			# display black box for our data
-			cv2.rectangle(heatmap, (0, 0),(160, 120), (0,0,0), -1)
-			# put text in the box
-			cv2.putText(heatmap,'Avg Temp: '+str(avgtemp)+' C', (10, 14),\
-			cv2.FONT_HERSHEY_SIMPLEX, 0.4,(0, 255, 255), 1, cv2.LINE_AA)
-
-			cv2.putText(heatmap,'Label Threshold: '+str(threshold)+' C', (10, 28),\
-			cv2.FONT_HERSHEY_SIMPLEX, 0.4,(0, 255, 255), 1, cv2.LINE_AA)
-
-			cv2.putText(heatmap,'Colormap: '+cmapText, (10, 42),\
-			cv2.FONT_HERSHEY_SIMPLEX, 0.4,(0, 255, 255), 1, cv2.LINE_AA)
-
-			cv2.putText(heatmap,'Blur: '+str(rad)+' ', (10, 56),\
-			cv2.FONT_HERSHEY_SIMPLEX, 0.4,(0, 255, 255), 1, cv2.LINE_AA)
-
-			cv2.putText(heatmap,'Scaling: '+str(scale)+' ', (10, 70),\
-			cv2.FONT_HERSHEY_SIMPLEX, 0.4,(0, 255, 255), 1, cv2.LINE_AA)
-
-			cv2.putText(heatmap,'Contrast: '+str(alpha)+' ', (10, 84),\
-			cv2.FONT_HERSHEY_SIMPLEX, 0.4,(0, 255, 255), 1, cv2.LINE_AA)
-
-
-			cv2.putText(heatmap,'Snapshot: '+snaptime+' ', (10, 98),\
-			cv2.FONT_HERSHEY_SIMPLEX, 0.4,(0, 255, 255), 1, cv2.LINE_AA)
-
-			if recording == False:
-				cv2.putText(heatmap,'Recording: '+elapsed, (10, 112),\
-				cv2.FONT_HERSHEY_SIMPLEX, 0.4,(200, 200, 200), 1, cv2.LINE_AA)
-			if recording == True:
-				cv2.putText(heatmap,'Recording: '+elapsed, (10, 112),\
-				cv2.FONT_HERSHEY_SIMPLEX, 0.4,(40, 40, 255), 1, cv2.LINE_AA)
-		
-		#Yeah, this looks like we can probably do this next bit more efficiently!
-		#display floating max temp
-		if maxtemp > avgtemp+threshold:
-			cv2.circle(heatmap, (mrow*scale, mcol*scale), 5, (0,0,0), 2)
-			cv2.circle(heatmap, (mrow*scale, mcol*scale), 5, (0,0,255), -1)
-			cv2.putText(heatmap,str(maxtemp)+' C', ((mrow*scale)+10, (mcol*scale)+5),\
-			cv2.FONT_HERSHEY_SIMPLEX, 0.45,(0,0,0), 2, cv2.LINE_AA)
-			cv2.putText(heatmap,str(maxtemp)+' C', ((mrow*scale)+10, (mcol*scale)+5),\
-			cv2.FONT_HERSHEY_SIMPLEX, 0.45,(0, 255, 255), 1, cv2.LINE_AA)
-
-		#display floating min temp
-		if mintemp < avgtemp-threshold:
-			cv2.circle(heatmap, (lrow*scale, lcol*scale), 5, (0,0,0), 2)
-			cv2.circle(heatmap, (lrow*scale, lcol*scale), 5, (255,0,0), -1)
-			cv2.putText(heatmap,str(mintemp)+' C', ((lrow*scale)+10, (lcol*scale)+5),\
-			cv2.FONT_HERSHEY_SIMPLEX, 0.45,(0,0,0), 2, cv2.LINE_AA)
-			cv2.putText(heatmap,str(mintemp)+' C', ((lrow*scale)+10, (lcol*scale)+5),\
-			cv2.FONT_HERSHEY_SIMPLEX, 0.45,(0, 255, 255), 1, cv2.LINE_AA)
-
-		#display image
-		if not args.headless:
-			cv2.imshow('Thermal',heatmap)
-
-		# Update streaming buffer if streaming is enabled
-		if args.stream and streaming_output is not None:
-			streaming_output.update_frame(heatmap)
-
-		if recording == True:
-			elapsed = (time.time() - start)
-			elapsed = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-			#print(elapsed)
-			videoOut.write(heatmap)
-
-		# Handle keyboard input (only works when not in headless mode)
-		if not args.headless:
-			keyPress = cv2.waitKey(1)
-		else:
-			# In headless mode, add small delay to prevent CPU spinning
-			time.sleep(0.01)
-			keyPress = -1
-		if keyPress == ord('a'): #Increase blur radius
-			rad += 1
-		if keyPress == ord('z'): #Decrease blur radius
-			rad -= 1
-			if rad <= 0:
-				rad = 0
-
-		if keyPress == ord('s'): #Increase threshold
-			threshold += 1
-		if keyPress == ord('x'): #Decrease threashold
-			threshold -= 1
-			if threshold <= 0:
-				threshold = 0
-
-		if keyPress == ord('d'): #Increase scale
-			scale += 1
-			if scale >=5:
-				scale = 5
-			newWidth = width*scale
-			newHeight = height*scale
-			if dispFullscreen == False and isPi == False and not args.headless:
-				cv2.resizeWindow('Thermal', newWidth,newHeight)
-		if keyPress == ord('c'): #Decrease scale
-			scale -= 1
-			if scale <= 1:
-				scale = 1
-			newWidth = width*scale
-			newHeight = height*scale
-			if dispFullscreen == False and isPi == False and not args.headless:
-				cv2.resizeWindow('Thermal', newWidth,newHeight)
-
-		if keyPress == ord('q') and not args.headless: #enable fullscreen
-			dispFullscreen = True
-			cv2.namedWindow('Thermal',cv2.WND_PROP_FULLSCREEN)
-			cv2.setWindowProperty('Thermal',cv2.WND_PROP_FULLSCREEN,cv2.WINDOW_FULLSCREEN)
-		if keyPress == ord('w') and not args.headless: #disable fullscreen
-			dispFullscreen = False
-			cv2.namedWindow('Thermal',cv2.WINDOW_GUI_NORMAL)
-			cv2.setWindowProperty('Thermal',cv2.WND_PROP_AUTOSIZE,cv2.WINDOW_GUI_NORMAL)
-			cv2.resizeWindow('Thermal', newWidth,newHeight)
-
-		if keyPress == ord('f'): #contrast+
-			alpha += 0.1
-			alpha = round(alpha,1)#fix round error
-			if alpha >= 3.0:
-				alpha=3.0
-		if keyPress == ord('v'): #contrast-
-			alpha -= 0.1
-			alpha = round(alpha,1)#fix round error
-			if alpha<=0:
-				alpha = 0.0
-
-
-		if keyPress == ord('h'):
-			if hud==True:
-				hud=False
-			elif hud==False:
-				hud=True
-
-		if keyPress == ord('m'): #m to cycle through color maps
-			colormap += 1
-			if colormap == 11:
-				colormap = 0
-
-		if keyPress == ord('r') and recording == False: #r to start reording
-			videoOut = rec()
-			recording = True
-			start = time.time()
-		if keyPress == ord('t'): #f to finish reording
-			recording = False
-			elapsed = "00:00:00"
-
-		if keyPress == ord('p'): #f to finish reording
-			snaptime = snapshot(heatmap)
-
-		if keyPress == ord('q'):
-			break
-			capture.release()
-			cv2.destroyAllWindows()
-		
+# Main loop - just keep the program running and update MQTT
+print("Thermal camera system running. Press Ctrl+C to exit.")
+try:
+	while True:
+		if mqtt_manager:
+			mqtt_manager.update()
+		time.sleep(1)
+except KeyboardInterrupt:
+	pass
+finally:
+	if camera:
+		camera.stop()
+	if mqtt_manager:
+		mqtt_manager.disconnect()
+	print("Exiting...")
