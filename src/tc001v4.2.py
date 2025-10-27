@@ -114,7 +114,7 @@ class CameraController:
 		self.colormap = 0
 		self.rad = 0
 		self.threshold = 2
-		self.hud = True
+		self.hud = False
 		self.recording = False
 		self.elapsed = "00:00:00"
 		self.snaptime = "None"
@@ -128,10 +128,16 @@ class CameraController:
 		self.start_time = time.time()
 
 		# Latest sensor data
-		self.maxtemp = None
-		self.mintemp = None
-		self.avgtemp = None
-		self.centertemp = None
+		self.temps = {
+			'max': None,
+			'min': None,
+			'avg': None,
+			'center': None,
+			'p25': None,
+			'p50': None,
+			'p75': None,
+			'p90': None,
+		}
 		self.lock = threading.Lock()
 
 	def start(self):
@@ -193,13 +199,9 @@ class CameraController:
 		if not self.running:
 			return None
 		with self.lock:
-			return {
-				'max': self.maxtemp,
-				'min': self.mintemp,
-				'avg': self.avgtemp,
-				'center': self.centertemp,
-				'time_since_start': time.time() - self.start_time,
-			}
+			result = self.temps.copy()
+			result['time_since_start'] = time.time() - self.start_time
+			return result
 
 	def _capture_loop(self):
 		while self.running and self.cap and self.cap.isOpened():
@@ -240,12 +242,23 @@ class CameraController:
 			avgtemp = float(temp_array.mean())
 			avgtemp = round(avgtemp, 2)
 
+			# Calculate percentiles efficiently (all at once)
+			percentiles = np.percentile(temp_array, [25, 50, 75, 90])
+			p25temp = round(float(percentiles[0]), 2)
+			p50temp = round(float(percentiles[1]), 2)
+			p75temp = round(float(percentiles[2]), 2)
+			p90temp = round(float(percentiles[3]), 2)
+
 			# Store temperatures
 			with self.lock:
-				self.maxtemp = maxtemp
-				self.mintemp = mintemp
-				self.avgtemp = avgtemp
-				self.centertemp = centertemp
+				self.temps['max'] = maxtemp
+				self.temps['min'] = mintemp
+				self.temps['avg'] = avgtemp
+				self.temps['center'] = centertemp
+				self.temps['p25'] = p25temp
+				self.temps['p50'] = p50temp
+				self.temps['p75'] = p75temp
+				self.temps['p90'] = p90temp
 
 			# Convert image to RGB and apply processing
 			bgr = cv2.cvtColor(imdata, cv2.COLOR_YUV2BGR_YUYV)
@@ -437,11 +450,26 @@ class MQTTManager:
 		self.base_topic = f"thermal_camera"
 		self.camera_command_topic = f"{self.base_topic}/camera/set"
 		self.camera_state_topic = f"{self.base_topic}/camera/state"
-		self.max_temp_state_topic = f"{self.base_topic}/max_temp/state"
+
+		# Temperature sensor metadata (key: sensor_key, value: human-readable name)
+		self.temp_sensors = {
+			'max': 'Max Temperature',
+			'min': 'Min Temperature',
+			'p25': 'P25 Temperature',
+			'p50': 'P50 Temperature (Median)',
+			'p75': 'P75 Temperature',
+			'p90': 'P90 Temperature',
+		}
+
+		# Generate state and config topics for all temperature sensors
+		self.temp_state_topics = {}
+		self.temp_config_topics = {}
+		for sensor_key in self.temp_sensors.keys():
+			self.temp_state_topics[sensor_key] = f"{self.base_topic}/{sensor_key}_temp/state"
+			self.temp_config_topics[sensor_key] = f"homeassistant/sensor/{device_id}/{sensor_key}_temp/config"
 
 		# Home Assistant discovery topics
 		self.switch_config_topic = f"homeassistant/switch/{device_id}/camera/config"
-		self.sensor_config_topic = f"homeassistant/sensor/{device_id}/max_temp/config"
 
 	def connect(self):
 		try:
@@ -531,20 +559,22 @@ class MQTTManager:
 			"device": device
 		}
 
-		# Sensor discovery config
-		sensor_config = {
-			"name": "Max Temperature",
-			"unique_id": f"{self.config.get('device_id', 'thermal_camera')}_max_temp",
-			"state_topic": self.max_temp_state_topic,
-			"unit_of_measurement": "°C",
-			"device_class": "temperature",
-			"state_class": "measurement",
-			"device": device
-		}
-
 		# Publish discovery messages
 		self.client.publish(self.switch_config_topic, json.dumps(switch_config), retain=True)
-		self.client.publish(self.sensor_config_topic, json.dumps(sensor_config), retain=True)
+
+		# Publish temperature sensor discovery configs
+		for sensor_key, sensor_name in self.temp_sensors.items():
+			sensor_config = {
+				"name": sensor_name,
+				"unique_id": f"{self.config.get('device_id', 'thermal_camera')}_{sensor_key}_temp",
+				"state_topic": self.temp_state_topics[sensor_key],
+				"unit_of_measurement": "°C",
+				"device_class": "temperature",
+				"state_class": "measurement",
+				"device": device
+			}
+			self.client.publish(self.temp_config_topics[sensor_key], json.dumps(sensor_config), retain=True)
+
 		print("MQTT: Published Home Assistant discovery messages")
 
 	def _publish_camera_state(self):
@@ -565,10 +595,12 @@ class MQTTManager:
 			self.last_publish_time = current_time
 			temps = self.camera.get_latest_temps()
 			if temps is not None and temps['time_since_start'] > 60:
-				if temps['max'] is not None:
-					self.client.publish(self.max_temp_state_topic, str(temps['max']))
-					temp_f = round(celsius_to_fahrenheit(temps['max']), 1)
-					print(f"MQTT: Published max temp: {temps['max']}°C ({temp_f}°F)")
+				# Publish all temperature sensors
+				for sensor_key in self.temp_sensors.keys():
+					if temps.get(sensor_key) is not None:
+						self.client.publish(self.temp_state_topics[sensor_key], str(temps[sensor_key]))
+						temp_f = round(celsius_to_fahrenheit(temps[sensor_key]), 1)
+						print(f"MQTT: Published temperature stat - {sensor_key}: {temps[sensor_key]}°C ({temp_f}°F)")
 
 	def disconnect(self):
 		if self.client:
