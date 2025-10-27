@@ -133,9 +133,7 @@ class CameraController:
 			'min': None,
 			'avg': None,
 			'center': None,
-			'p25': None,
 			'p50': None,
-			'p75': None,
 			'p90': None,
 		}
 		self.lock = threading.Lock()
@@ -243,11 +241,9 @@ class CameraController:
 			avgtemp = round(avgtemp, 2)
 
 			# Calculate percentiles efficiently (all at once)
-			percentiles = np.percentile(temp_array, [25, 50, 75, 90])
-			p25temp = round(float(percentiles[0]), 2)
-			p50temp = round(float(percentiles[1]), 2)
-			p75temp = round(float(percentiles[2]), 2)
-			p90temp = round(float(percentiles[3]), 2)
+			percentiles = np.percentile(temp_array, [50, 90])
+			p50temp = round(float(percentiles[0]), 2)
+			p90temp = round(float(percentiles[1]), 2)
 
 			# Store temperatures
 			with self.lock:
@@ -255,9 +251,7 @@ class CameraController:
 				self.temps['min'] = mintemp
 				self.temps['avg'] = avgtemp
 				self.temps['center'] = centertemp
-				self.temps['p25'] = p25temp
 				self.temps['p50'] = p50temp
-				self.temps['p75'] = p75temp
 				self.temps['p90'] = p90temp
 
 			# Convert image to RGB and apply processing
@@ -455,9 +449,7 @@ class MQTTManager:
 		self.temp_sensors = {
 			'max': 'Max Temperature',
 			'min': 'Min Temperature',
-			'p25': 'P25 Temperature',
 			'p50': 'P50 Temperature (Median)',
-			'p75': 'P75 Temperature',
 			'p90': 'P90 Temperature',
 		}
 
