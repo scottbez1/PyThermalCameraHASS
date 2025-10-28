@@ -164,6 +164,9 @@ class CameraController:
 		if self.mqtt_manager:
 			self.mqtt_manager._publish_camera_state()
 
+		# Broadcast state change to SSE clients
+		broadcast_camera_state("on")
+
 	def stop(self):
 		if not self.running:
 			return
@@ -192,6 +195,9 @@ class CameraController:
 		# Publish state change to MQTT
 		if self.mqtt_manager:
 			self.mqtt_manager._publish_camera_state()
+
+		# Broadcast state change to SSE clients
+		broadcast_camera_state("off")
 
 	def get_latest_temps(self):
 		if not self.running:
@@ -373,6 +379,25 @@ class StreamingOutput:
 		self.frame_event.clear()
 		return self.frame_event.wait(timeout)
 
+# SSE client management for real-time state updates
+sse_clients = []
+sse_clients_lock = threading.Lock()
+
+def broadcast_camera_state(state):
+	"""Broadcast camera state to all connected SSE clients"""
+	with sse_clients_lock:
+		disconnected = []
+		for client in sse_clients:
+			try:
+				msg = f"data: {state}\n\n"
+				client.wfile.write(msg.encode())
+				client.wfile.flush()
+			except Exception:
+				disconnected.append(client)
+		# Remove disconnected clients
+		for client in disconnected:
+			sse_clients.remove(client)
+
 class StreamingHandler(BaseHTTPRequestHandler):
 	def do_GET(self):
 		if self.path == '/stream.mjpg':
@@ -403,20 +428,133 @@ class StreamingHandler(BaseHTTPRequestHandler):
 							last_frame_id = frame_id
 			except Exception:
 				pass
+		elif self.path == '/events':
+			# SSE endpoint for real-time camera state updates
+			self.send_response(200)
+			self.send_header('Content-Type', 'text/event-stream')
+			self.send_header('Cache-Control', 'no-cache')
+			self.send_header('Connection', 'keep-alive')
+			self.end_headers()
+
+			# Add this client to SSE clients list
+			with sse_clients_lock:
+				sse_clients.append(self)
+
+			# Send initial state
+			try:
+				state = "on" if camera.running else "off"
+				msg = f"data: {state}\n\n"
+				self.wfile.write(msg.encode())
+				self.wfile.flush()
+
+				# Keep connection alive
+				while True:
+					time.sleep(30)
+					# Send keep-alive comment
+					self.wfile.write(b": keep-alive\n\n")
+					self.wfile.flush()
+			except Exception:
+				pass
+			finally:
+				# Remove client when disconnected
+				with sse_clients_lock:
+					if self in sse_clients:
+						sse_clients.remove(self)
 		elif self.path == '/':
 			self.send_response(200)
 			self.send_header('Content-Type', 'text/html')
 			self.end_headers()
 			html = b'''
 			<html>
-			<head><title>Thermal Camera Stream</title></head>
+			<head>
+				<title>Thermal Camera Stream</title>
+				<style>
+					button:disabled { opacity: 0.5; }
+				</style>
+			</head>
 			<body>
-			<h1>TC001 Thermal Camera Stream</h1>
-			<img src="/stream.mjpg" />
+				<h1>TC001 Thermal Camera Stream</h1>
+				<p>Status: <span id="status">...</span></p>
+				<button id="onBtn">Turn ON</button>
+				<button id="offBtn">Turn OFF</button>
+				<br><br>
+				<img src="/stream.mjpg" />
+				<script>
+					const status = document.getElementById('status');
+					const onBtn = document.getElementById('onBtn');
+					const offBtn = document.getElementById('offBtn');
+
+					function updateUI(state) {
+						status.textContent = state === 'on' ? 'ON' : 'OFF';
+						onBtn.disabled = state === 'on';
+						offBtn.disabled = state === 'off';
+					}
+
+					async function sendControl(action) {
+						try {
+							const response = await fetch('/control', {
+								method: 'POST',
+								headers: { 'Content-Type': 'application/json' },
+								body: JSON.stringify({ action: action })
+							});
+							const data = await response.json();
+							if (data.status === 'ok') {
+								updateUI(data.state);
+							}
+						} catch (e) {
+							console.error('Control error:', e);
+						}
+					}
+
+					onBtn.addEventListener('click', () => sendControl('start'));
+					offBtn.addEventListener('click', () => sendControl('stop'));
+
+					// Connect to SSE for real-time updates
+					const events = new EventSource('/events');
+					events.onmessage = (e) => updateUI(e.data);
+					events.onerror = () => console.error('SSE connection error');
+				</script>
 			</body>
 			</html>
 			'''
 			self.wfile.write(html)
+		else:
+			self.send_response(404)
+			self.end_headers()
+
+	def do_POST(self):
+		if self.path == '/control':
+			# Read POST data
+			content_length = int(self.headers.get('Content-Length', 0))
+			post_data = self.rfile.read(content_length)
+
+			try:
+				# Parse JSON
+				data = json.loads(post_data.decode())
+				action = data.get('action')
+
+				if action == 'start':
+					camera.start()
+					self.send_response(200)
+					self.send_header('Content-Type', 'application/json')
+					self.end_headers()
+					self.wfile.write(json.dumps({'status': 'ok', 'state': 'on'}).encode())
+				elif action == 'stop':
+					camera.stop()
+					self.send_response(200)
+					self.send_header('Content-Type', 'application/json')
+					self.end_headers()
+					self.wfile.write(json.dumps({'status': 'ok', 'state': 'off'}).encode())
+				else:
+					self.send_response(400)
+					self.send_header('Content-Type', 'application/json')
+					self.end_headers()
+					self.wfile.write(json.dumps({'status': 'error', 'message': 'Invalid action'}).encode())
+			except Exception as e:
+				self.send_response(500)
+				self.send_header('Content-Type', 'application/json')
+				self.end_headers()
+				self.wfile.write(json.dumps({'status': 'error', 'message': str(e)}).encode())
 		else:
 			self.send_response(404)
 			self.end_headers()
