@@ -398,7 +398,7 @@ def broadcast_camera_state(state):
 		disconnected = []
 		for client in sse_clients:
 			try:
-				msg = f"data: {state}\n\n"
+				msg = f"event: state\ndata: {state}\n\n"
 				client.wfile.write(msg.encode())
 				client.wfile.flush()
 			except Exception:
@@ -452,16 +452,25 @@ class StreamingHandler(BaseHTTPRequestHandler):
 			# Send initial state
 			try:
 				state = "on" if camera.running else "off"
-				msg = f"data: {state}\n\n"
+				msg = f"event: state\ndata: {state}\n\n"
 				self.wfile.write(msg.encode())
 				self.wfile.flush()
 
-				# Keep connection alive
+				# Send temperature updates every second
 				while True:
-					time.sleep(30)
-					# Send keep-alive comment
-					self.wfile.write(b": keep-alive\n\n")
-					self.wfile.flush()
+					time.sleep(1)
+
+					# Get current temperatures
+					temps = camera.get_latest_temps()
+					if temps:
+						# Add timestamp
+						timestamp = datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+						temps['timestamp'] = timestamp
+
+						# Send temperature data as JSON
+						msg = f"event: temps\ndata: {json.dumps(temps)}\n\n"
+						self.wfile.write(msg.encode())
+						self.wfile.flush()
 			except Exception:
 				pass
 			finally:
@@ -479,6 +488,8 @@ class StreamingHandler(BaseHTTPRequestHandler):
 				<title>Thermal Camera Stream</title>
 				<style>
 					button:disabled { opacity: 0.5; }
+					table { border-collapse: collapse; margin: 10px 0; }
+					td, th { border: 1px solid black; padding: 5px; text-align: left; }
 				</style>
 			</head>
 			<body>
@@ -487,6 +498,16 @@ class StreamingHandler(BaseHTTPRequestHandler):
 				<button id="onBtn">Turn ON</button>
 				<button id="offBtn">Turn OFF</button>
 				<br><br>
+				<table>
+					<tr><th>Metric</th><th>Value (&deg;C)</th></tr>
+					<tr><td>Timestamp</td><td id="timestamp">-</td></tr>
+					<tr><td>Max</td><td id="max">-</td></tr>
+					<tr><td>Min</td><td id="min">-</td></tr>
+					<tr><td>Avg</td><td id="avg">-</td></tr>
+					<tr><td>Center</td><td id="center">-</td></tr>
+					<tr><td>P50 (Median)</td><td id="p50">-</td></tr>
+					<tr><td>P90</td><td id="p90">-</td></tr>
+				</table>
 				<img src="/stream.mjpg" />
 				<script>
 					const status = document.getElementById('status');
@@ -497,6 +518,16 @@ class StreamingHandler(BaseHTTPRequestHandler):
 						status.textContent = state === 'on' ? 'ON' : 'OFF';
 						onBtn.disabled = state === 'on';
 						offBtn.disabled = state === 'off';
+					}
+
+					function updateTemps(data) {
+						document.getElementById('timestamp').textContent = data.timestamp || '-';
+						document.getElementById('max').textContent = data.max !== null ? data.max : '-';
+						document.getElementById('min').textContent = data.min !== null ? data.min : '-';
+						document.getElementById('avg').textContent = data.avg !== null ? data.avg : '-';
+						document.getElementById('center').textContent = data.center !== null ? data.center : '-';
+						document.getElementById('p50').textContent = data.p50 !== null ? data.p50 : '-';
+						document.getElementById('p90').textContent = data.p90 !== null ? data.p90 : '-';
 					}
 
 					async function sendControl(action) {
@@ -520,7 +551,8 @@ class StreamingHandler(BaseHTTPRequestHandler):
 
 					// Connect to SSE for real-time updates
 					const events = new EventSource('/events');
-					events.onmessage = (e) => updateUI(e.data);
+					events.addEventListener('state', (e) => updateUI(e.data));
+					events.addEventListener('temps', (e) => updateTemps(JSON.parse(e.data)));
 					events.onerror = () => console.error('SSE connection error');
 				</script>
 			</body>
