@@ -28,6 +28,7 @@ import cv2
 import numpy as np
 import argparse
 import time
+from datetime import datetime
 import io
 import threading
 import socketserver
@@ -341,6 +342,14 @@ class CameraController:
 						cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
 				cv2.putText(heatmap, str(mintemp_f)+' F', ((lrow*self.scale)+10, (lcol*self.scale)+5),
 						cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+
+			# Add timestamp overlay in bottom left corner
+			timestamp = datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]  # ISO8601 with milliseconds
+			text_y = self.newHeight - 10  # 10 pixels from bottom
+			cv2.putText(heatmap, timestamp, (10, text_y),
+					cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
+			cv2.putText(heatmap, timestamp, (10, text_y),
+					cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
 			# Display image if not headless
 			if not self.headless and not args.headless:
