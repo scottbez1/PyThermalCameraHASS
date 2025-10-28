@@ -499,7 +499,7 @@ class StreamingHandler(BaseHTTPRequestHandler):
 				<button id="offBtn">Turn OFF</button>
 				<br><br>
 				<table>
-					<tr><th>Metric</th><th>Value (&deg;C)</th></tr>
+					<tr><th>Metric</th><th>Value (&deg;F)</th></tr>
 					<tr><td>Timestamp</td><td id="timestamp">-</td></tr>
 					<tr><td>Max</td><td id="max">-</td></tr>
 					<tr><td>Min</td><td id="min">-</td></tr>
@@ -514,6 +514,10 @@ class StreamingHandler(BaseHTTPRequestHandler):
 					const onBtn = document.getElementById('onBtn');
 					const offBtn = document.getElementById('offBtn');
 
+					function celsiusToFahrenheit(c) {
+						return Math.round((c * 9/5 + 32) * 10) / 10;
+					}
+
 					function updateUI(state) {
 						status.textContent = state === 'on' ? 'ON' : 'OFF';
 						onBtn.disabled = state === 'on';
@@ -522,12 +526,12 @@ class StreamingHandler(BaseHTTPRequestHandler):
 
 					function updateTemps(data) {
 						document.getElementById('timestamp').textContent = data.timestamp || '-';
-						document.getElementById('max').textContent = data.max !== null ? data.max : '-';
-						document.getElementById('min').textContent = data.min !== null ? data.min : '-';
-						document.getElementById('avg').textContent = data.avg !== null ? data.avg : '-';
-						document.getElementById('center').textContent = data.center !== null ? data.center : '-';
-						document.getElementById('p50').textContent = data.p50 !== null ? data.p50 : '-';
-						document.getElementById('p90').textContent = data.p90 !== null ? data.p90 : '-';
+						document.getElementById('max').textContent = data.max !== null ? celsiusToFahrenheit(data.max) : '-';
+						document.getElementById('min').textContent = data.min !== null ? celsiusToFahrenheit(data.min) : '-';
+						document.getElementById('avg').textContent = data.avg !== null ? celsiusToFahrenheit(data.avg) : '-';
+						document.getElementById('center').textContent = data.center !== null ? celsiusToFahrenheit(data.center) : '-';
+						document.getElementById('p50').textContent = data.p50 !== null ? celsiusToFahrenheit(data.p50) : '-';
+						document.getElementById('p90').textContent = data.p90 !== null ? celsiusToFahrenheit(data.p90) : '-';
 					}
 
 					async function sendControl(action) {
